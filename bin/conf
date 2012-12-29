@@ -1,0 +1,281 @@
+#!/bin/bash
+
+black='\e[0;30m'
+red='\e[0;31m'
+green='\e[0;32m'
+yellow='\e[0;33m'
+blue='\e[0;34m'
+magenta='\e[0;35m'
+cyan='\e[0;36m'
+white='\e[0;37m'
+colors_reset='\e[m'
+
+error() {
+    local message=$1
+    local error_code=$2
+
+    echo "$message"
+    exit $error_code
+}
+
+usage() {
+    local script=$(basename $0)
+
+    echo "usage:"
+    echo -e "\t$script (install|list|status|update|update-all|apply|diff|new)"
+}
+
+check_var() {
+    local var=$1
+    local var_value=$(eval "echo \$$var")
+
+    [ -z "$var_value" ] && error "Unspecified value for $var"
+}
+
+check_config() {
+    check_var "REMOTE_CONF"
+    check_var "LOCAL_CONF_DIR"
+}
+
+load_config() {
+    if ! [ -f $HOME/.confrc ]; then
+        error "No configuration file found in $HOME/.confrc"
+    fi
+    . $HOME/.confrc
+    check_config
+}
+
+exit_if_module_does_not_exists() {
+    local config_module=$1
+
+    [ ! -d "${LOCAL_CONF_DIR}/${config_module}" ] && error "${config_module} module is not installed or does not exists."
+}
+
+get_func_body() {
+    local func_name=$1
+
+    type -a $func_name | tail -n +2
+}
+
+execute_local() {
+    local func_name=$1
+    shift
+    local func=$(get_func_body $func_name)
+
+    eval "$func; $func_name $*"
+}
+
+execute_remote() {
+    local ssh_conn=$1
+    shift
+    local func_name=$1
+    shift
+    local func=$(get_func_body $func_name)
+
+    ssh $ssh_conn "$func; $func_name $*" 2> /dev/null
+}
+
+apply_on() {
+    func=$1
+    shift
+    modules=$([ $# -eq 0 ] && all_modules || echo $*)
+    for module in $modules; do
+        $func $module
+    done
+}
+
+git_current_branch() {
+    git branch | grep '^\*' | cut -d' ' -f2
+}
+
+git_remote_branch() {
+    git branch -vv | grep '^\*' | cut -d' ' -f4 | tr -d '[]:'
+}
+
+all_modules() {
+    _list_modules "$LOCAL_CONF_DIR"
+}
+
+_apply_chef() {
+    [ -f solo.rb ] && [ -f solo.json ] && chef-solo -Fdoc -c solo.rb -j solo.json -l fatal
+}
+
+_root_apply_chef() {
+    [ -f solo.rb ] && [ -f solo_root.json ] && sudo chef-solo -Fdoc -c solo.rb -j solo_root.json -l fatal
+}
+
+install_module() {
+    local config_module=$1
+
+    if [ -d "${LOCAL_CONF_DIR}/${config_module}" ]; then
+        update_module $config_module
+    else
+        echo "Installing module $config_module"
+        mkdir -p "${LOCAL_CONF_DIR}"
+        cd "${LOCAL_CONF_DIR}"
+        git clone "${REMOTE_CONF}/${config_module}.git"
+        cd ${config_module}/conf
+        [ -f .gitmodules ] && git submodule update --init --recursive
+        _root_apply_chef
+        _apply_chef
+    fi
+}
+
+module_git_status() {
+    local module_name=$1
+    local output=$2
+
+    if [ -d "$LOCAL_CONF_DIR/$module_name" ]; then
+        cd "$LOCAL_CONF_DIR/$module_name"
+        local changes_count=$(git status --porcelain | wc -l)
+        if [ $changes_count -eq 0 ]; then
+            echo -n "$output"
+        else
+            echo -n "${red}${output}${colors_reset}"
+        fi
+        cd - > /dev/null
+    else
+        echo -n "$module_name"
+    fi
+}
+
+_list_modules() {
+    local path=$1
+
+    for m in $(ls $path | sort); do
+        if [ -d ${path}/$m ]; then
+            cd ${path}/$m
+            suffix=${m#*.}
+            module_name=$(echo $m | sed -e 's/\.git$//g')
+            if [ "$suffix" = "git" ] || [ -d "$path/$m/.git" ]; then
+                echo "$module_name"
+            fi
+        fi
+    done
+}
+
+list_modules() {
+    local remote_ssh_conn=${REMOTE_CONF%%:*}
+    local remote_path=${REMOTE_CONF##*:}
+
+    execute_remote "$remote_ssh_conn" "_list_modules" $remote_path
+}
+
+status_module_apply() {
+    local config_module=$1
+    local diff_output=$(diff_chef $config_module)
+
+    if [ -z "$diff_output" ]; then
+        echo -n "${green}$config_module${colors_reset}"
+    else
+        echo -n "${red}${config_module}*${colors_reset}"
+    fi
+}
+
+status_module() {
+    local OLD_IFS=$IFS
+    local NONE="${red}None${colors_reset}"
+    local config_module=$1
+    local module_name=$(status_module_apply $config_module)
+    IFS=$'\n'
+
+    exit_if_module_does_not_exists $config_module
+    cd "$LOCAL_CONF_DIR/$config_module"
+    local update_output=$(git remote update)
+    local local_rev=$(git rev-parse --short $(git_current_branch))
+    local remote_rev=$(git rev-parse --short $(git_remote_branch))
+
+    if [ "$local_rev" = "$remote_rev" ]; then
+        printf "${green}%-50b${colors_reset}(${green}$(module_git_status $config_module $local_rev)${colors_reset})\n" "$module_name"
+    else
+        if [ -z "$remote_rev" ]; then
+            printf "${red}%-50b${colors_reset}(${red}$(module_git_status $config_module $local_rev)${colors_reset}/$NONE)\n" "$module_name"
+        else
+            printf "${yellow}%-50b${colors_reset}(${yellow}$(module_git_status $config_module $local_rev/$remote_rev)${colors_reset})\n" "$module_name"
+        fi
+    fi
+    IFS=$OLD_IFS
+}
+
+update_module() {
+    local config_module=$1
+
+    echo "Updating module $config_module"
+    exit_if_module_does_not_exists $config_module
+    cd "${LOCAL_CONF_DIR}/${config_module}/conf"
+    git pull --rebase
+    [ -f .gitmodules ] && git submodule update --recursive
+    _root_apply_chef
+    _apply_chef
+}
+
+apply_chef() {
+    local config_module=$1
+
+    echo "Applying Chef configuration of module $config_module"
+    exit_if_module_does_not_exists $config_module
+    cd "${LOCAL_CONF_DIR}/${config_module}/conf"
+    _root_apply_chef
+    _apply_chef
+}
+
+diff_chef() {
+    local config_module=$1
+
+    exit_if_module_does_not_exists $config_module
+}
+
+new_module() {
+    local config_module=$1
+    local remote_ssh_conn=${REMOTE_CONF%%:*}
+    local remote_path=${REMOTE_CONF##*:}
+    local module_path=$remote_path/${config_module}.git
+
+    echo "Creating remote module $config_module"
+    ssh $remote_ssh_conn "mkdir -p $module_path; cd $module_path; git init --bare"
+    cd "$LOCAL_CONF_DIR"
+    echo "Getting module $config_module"
+    git clone "${REMOTE_CONF}/${config_module}.git" "${config_module}"
+}
+
+load_config
+
+action=$1
+shift
+old_pwd=`pwd`
+
+case "$action" in
+    install)
+        apply_on install_module $*
+        ;;
+    list)
+        list_modules
+        ;;
+    update)
+        apply_on update_module $*
+        ;;
+    apply)
+        apply_on apply_chef $*
+        ;;
+    diff)
+        apply_on diff_chef $*
+        ;;
+    new)
+        new_module $*
+        ;;
+    status)
+        apply_on status_module $*
+        ;;
+    help)
+        usage
+        exit 1
+        ;;
+    *)
+        usage
+        exit 1
+        ;;
+esac
+
+cd $old_pwd
+
+exit 0
