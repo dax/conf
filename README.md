@@ -8,7 +8,7 @@ Installation
 
     curl https://raw.github.com/dax/conf/master/bootstrap.sh | sh
 
-The script should have created a file `${HOME}/confrc` with 2 variables:
+The script should have created a file `${HOME}/.confrc` with 2 variables:
 
 * `LOCAL_CONF_DIR`: is the directory where all conf modules will be installed
 * `REMOTE_CONF`: is the base git url where conf modules can be found (eg. `git://github.com/dax` or `user@host:/path/to/modules`)
